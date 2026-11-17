@@ -1,6 +1,10 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// port it bound, then poll until the env says the trial is over and exit 0. The lifecycle below is the
+// harness's and is unchanged from the starter; what it serves is this entry's forge — app.ts builds a
+// single-process GitHub-compatible forge (git smart HTTP, REST v3, GraphQL and MCP over one in-memory
+// store in store.ts; git objects and packs are implemented in gitobj.ts, the wire protocol in
+// smarthttp.ts). All forge state derives from a logical sequence clock, never the wall clock, so a
+// replay of the same traffic exports byte-identical state.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
