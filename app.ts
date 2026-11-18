@@ -71,7 +71,8 @@ const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-rece
 export function createApp(): Server {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const forge = new Forge(token);
-  const authorized = (req: IncomingMessage): boolean => token === '' || req.headers.authorization === `Bearer ${token}`;
+  // Fail closed (B1): an unset/empty token authorizes nothing, never everything.
+  const authorized = (req: IncomingMessage): boolean => token !== '' && req.headers.authorization === `Bearer ${token}`;
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
