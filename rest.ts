@@ -5,6 +5,7 @@
 import { isOid, parseCommit, parseTree } from './gitobj.ts';
 import {
   Forge,
+  PathConflictError,
   Repo,
   commitFileChange,
   diffCommits,
@@ -202,9 +203,14 @@ function stringField(body: Record<string, unknown>, key: string): string | undef
 // route handlers
 // ---------------------------------------------------------------------------------------------
 
+/** The repository-name rule every creation surface (REST, MCP) enforces identically. */
+export function isValidRepoName(name: string): boolean {
+  return name !== '' && /^[A-Za-z0-9._-]+$/.test(name) && name !== '.' && name !== '..';
+}
+
 function createRepo(forge: Forge, body: Record<string, unknown>): RestResult {
   const name = stringField(body, 'name');
-  if (name === undefined || name === '' || !/^[A-Za-z0-9._-]+$/.test(name) || name === '.' || name === '..') {
+  if (name === undefined || !isValidRepoName(name)) {
     return err(422, 'name is invalid');
   }
   if (forge.repo(forge.viewer.login, name) !== null) {
@@ -355,7 +361,14 @@ function putContents(forge: Forge, repo: Repo, path: string, body: Record<string
     if (sha !== existing.oid) return err(409, `${path} does not match ${sha}`);
   }
   const bytes = Buffer.from(content, 'base64');
-  const { commitOid, blobOid } = commitFileChange(forge, repo, { branch, path, content: bytes, message });
+  let commitOid: string;
+  let blobOid: string | null;
+  try {
+    ({ commitOid, blobOid } = commitFileChange(forge, repo, { branch, path, content: bytes, message }));
+  } catch (error) {
+    if (error instanceof PathConflictError) return err(422, `Validation Failed: ${error.message}`);
+    throw error;
+  }
   return {
     status: existing !== undefined ? 200 : 201,
     body: {
@@ -414,17 +427,19 @@ function listIssues(forge: Forge, repo: Repo, query: URLSearchParams, url: strin
 }
 
 function patchIssue(forge: Forge, repo: Repo, issue: Issue, body: Record<string, unknown>): RestResult {
+  // Validate everything before mutating anything: a rejected PATCH must not partially apply.
+  let labels: string[] | undefined;
+  if (Array.isArray(body.labels)) {
+    labels = body.labels.filter((l): l is string => typeof l === 'string');
+    for (const label of labels) if (!repo.labels.has(label)) return err(422, `Validation Failed: label "${label}" does not exist`);
+  }
   const state = stringField(body, 'state');
   if (state === 'open' || state === 'closed') issue.state = state;
   const title = stringField(body, 'title');
   if (title !== undefined) issue.title = title;
   const text = stringField(body, 'body');
   if (text !== undefined) issue.body = text;
-  if (Array.isArray(body.labels)) {
-    const labels = body.labels.filter((l): l is string => typeof l === 'string');
-    for (const label of labels) if (!repo.labels.has(label)) return err(422, `Validation Failed: label "${label}" does not exist`);
-    issue.labels = labels;
-  }
+  if (labels !== undefined) issue.labels = labels;
   issue.updatedSeq = forge.tick();
   return { status: 200, body: issueJson(forge, repo, issue) };
 }
@@ -622,7 +637,11 @@ export function handleRest(
       if (method === 'GET') {
         const comments = repo.comments.get(issue.number) ?? [];
         const page = paginate(comments, query, selfUrl);
-        return { status: 200, body: page.items.map((comment) => commentJson(forge, comment)) };
+        return {
+          status: 200,
+          body: page.items.map((comment) => commentJson(forge, comment)),
+          headers: page.link === null ? {} : { link: page.link },
+        };
       }
       return notFound();
     }

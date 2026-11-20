@@ -489,12 +489,18 @@ function pullRequestsConnection(ctx: Ctx, repo: Repo, args: Record<string, unkno
     list = list.filter((pull) => pull.state === 'open');
   }
   list.sort((a, b) => b.seq - a.seq);
+  let start = 0;
+  if (args.after !== undefined && args.after !== null) {
+    const decoded = decodeCursor(args.after);
+    if (decoded !== null) start = decoded;
+  }
   const first = typeof args.first === 'number' ? Math.max(0, Math.trunc(args.first)) : list.length;
-  const slice = list.slice(0, first);
+  const slice = list.slice(start, start + first);
+  const end = start + slice.length;
   return {
     __typename: 'PullRequestConnection',
     nodes: slice.map((pull) => pullParent(repo, pull)),
-    pageInfo: pageInfoParent(slice.length < list.length, null),
+    pageInfo: pageInfoParent(end < list.length, encodeCursor(end)),
     totalCount: list.length,
   };
 }
@@ -734,11 +740,18 @@ const SCHEMA: Record<string, Record<string, Resolver>> = {
           }));
         }
       }
+      let start = 0;
+      if (args.after !== undefined && args.after !== null) {
+        const decoded = decodeCursor(args.after);
+        if (decoded !== null) start = decoded;
+      }
       const first = typeof args.first === 'number' ? Math.max(0, Math.trunc(args.first)) : nodes.length;
+      const slice = nodes.slice(start, start + first);
+      const end = start + slice.length;
       return {
         __typename: 'PullRequestChangedFileConnection',
-        nodes: nodes.slice(0, first),
-        pageInfo: pageInfoParent(false, null),
+        nodes: slice,
+        pageInfo: pageInfoParent(end < nodes.length, encodeCursor(end)),
         totalCount: nodes.length,
       };
     },
@@ -939,7 +952,11 @@ function executeOne(forge: Forge, body: Record<string, unknown>): GqlEnvelope {
   let operation: Operation | undefined;
   if (operationName !== undefined) operation = document.operations.find((op) => op.name === operationName);
   else if (document.operations.length === 1) operation = document.operations[0];
-  else operation = document.operations[0];
+  else {
+    // The GraphQL spec: a document with several operations and no operationName is an
+    // error — never silently execute the first one.
+    return { data: null, errors: [{ message: 'Must provide operation name if query contains multiple operations.' }] };
+  }
   if (operation === undefined) return { data: null, errors: [{ message: 'operation not found' }] };
   const vars: Record<string, unknown> = {};
   const given = (body.variables ?? {}) as Record<string, unknown>;

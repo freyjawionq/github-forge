@@ -4,7 +4,7 @@
 // results carry both a text block and structuredContent holding the REST-shaped object.
 
 import { Forge, Repo, mergePullRequest } from './store.ts';
-import { createIssue, createPull, issueJson, pullJson, repoJson } from './rest.ts';
+import { createIssue, createPull, isValidRepoName, issueJson, pullJson, repoJson } from './rest.ts';
 
 const SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const SERVER_INFO = { name: 'makefun-forge', version: '1.0.0' };
@@ -129,6 +129,8 @@ function callTool(forge: Forge, name: string, args: Record<string, unknown>): { 
       const bad = missing(['name']);
       if (bad) return { error: { code: -32602, message: `missing required argument: ${bad}` } };
       const repoName = String(args.name);
+      // Same name rule REST enforces (F5): an invalid name must not create a repository here.
+      if (!isValidRepoName(repoName)) return { result: toolError('name is invalid') };
       if (forge.repo(forge.viewer.login, repoName) !== null) return { result: toolError(`repository ${repoName} already exists`) };
       const repo = forge.createRepo(repoName, typeof args.description === 'string' ? args.description : '', args.private === true);
       return { result: toolResult(repoJson(forge, repo)) };

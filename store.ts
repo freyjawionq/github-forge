@@ -169,6 +169,11 @@ export class Repo {
       node.files.set(segments[segments.length - 1]!, entry);
     }
     const build = (node: Node): string => {
+      // Invariant: a name may be a file or a directory, never both — git rejects such trees
+      // (duplicateEntries), so refuse to build one instead of emitting an invalid object.
+      for (const name of node.files.keys()) {
+        if (node.dirs.has(name)) throw new Error(`tree build collision at "${name}": path is both a file and a directory`);
+      }
       const entries: TreeEntry[] = [];
       for (const [name, entry] of node.files) entries.push({ mode: entry.mode, name, oid: entry.oid });
       for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, oid: build(child) });
@@ -307,6 +312,39 @@ export class Forge {
 // cross-surface operations
 // ---------------------------------------------------------------------------------------------
 
+/** Thrown when a contents write would make one path both a file and a directory. */
+export class PathConflictError extends Error {
+  constructor(path: string) {
+    super(`path "${path}" conflicts with an existing file or directory`);
+    this.name = 'PathConflictError';
+  }
+}
+
+/**
+ * True when placing a file at `path` inside `flat` would collide with the tree's shape:
+ * a leading segment of `path` is already a file, or existing files live under `path`.
+ */
+export function pathConflicts(flat: ReadonlyMap<string, { mode: string; oid: string }>, path: string): boolean {
+  const segments = path.split('/');
+  for (let i = 1; i < segments.length; i += 1) {
+    if (flat.has(segments.slice(0, i).join('/'))) return true;
+  }
+  const prefix = `${path}/`;
+  for (const key of flat.keys()) if (key.startsWith(prefix)) return true;
+  return false;
+}
+
+/** True when a flattened path map cannot form a tree: some path is a file and a directory prefix at once. */
+export function flatHasCollision(flat: ReadonlyMap<string, { mode: string; oid: string }>): boolean {
+  for (const key of flat.keys()) {
+    const segments = key.split('/');
+    for (let i = 1; i < segments.length; i += 1) {
+      if (flat.has(segments.slice(0, i).join('/'))) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Commit a file change (create/update/delete) on a branch through the contents model.
  * `branch` must already exist as a ref or be the default branch; a missing non-default branch
@@ -328,6 +366,7 @@ export function commitFileChange(
   if (fields.content === null) {
     flat.delete(fields.path);
   } else {
+    if (pathConflicts(flat, fields.path)) throw new PathConflictError(fields.path);
     blobOid = repo.put('blob', fields.content);
     flat.set(fields.path, { mode: '100644', oid: blobOid });
   }
@@ -387,7 +426,7 @@ export function diffCommits(repo: Repo, baseTip: string, headTip: string): FileC
   for (const path of [...paths].sort()) {
     const before = baseFlat.get(path);
     const after = headFlat.get(path);
-    if (before && after && before.oid === after.oid) continue;
+    if (before && after && before.oid === after.oid && before.mode === after.mode) continue;
     const oldData = before ? (repo.get(before.oid)?.data ?? null) : null;
     const newData = after ? (repo.get(after.oid)?.data ?? null) : null;
     const { additions, deletions } = lineDiff(oldData, newData);
@@ -429,8 +468,8 @@ export function mergePullRequest(forge: Forge, repo: Repo, pull: Pull): MergeOut
     const inAncestor = ancestorFlat.get(path);
     const inBase = baseFlat.get(path);
     const inHead = headFlat.get(path);
-    const baseChanged = inBase?.oid !== inAncestor?.oid || (inBase === undefined) !== (inAncestor === undefined);
-    const headChanged = inHead?.oid !== inAncestor?.oid || (inHead === undefined) !== (inAncestor === undefined);
+    const baseChanged = inBase?.oid !== inAncestor?.oid || inBase?.mode !== inAncestor?.mode || (inBase === undefined) !== (inAncestor === undefined);
+    const headChanged = inHead?.oid !== inAncestor?.oid || inHead?.mode !== inAncestor?.mode || (inHead === undefined) !== (inAncestor === undefined);
     if (baseChanged && headChanged) {
       if (inBase?.oid === inHead?.oid && inBase?.mode === inHead?.mode) {
         if (inBase) merged.set(path, inBase);
@@ -441,6 +480,8 @@ export function mergePullRequest(forge: Forge, repo: Repo, pull: Pull): MergeOut
     const winner = headChanged ? inHead : inBase;
     if (winner) merged.set(path, winner);
   }
+  // A file/directory type change split across the two sides cannot form a tree: a conflict.
+  if (flatHasCollision(merged)) return { ok: false, reason: 'conflict' };
   const tree = repo.buildFromFlat(merged);
   const message = pull.body === '' ? `${pull.title} (#${pull.number})\n` : `${pull.title} (#${pull.number})\n\n${pull.body}\n`;
   const { oid, seq } = forge.makeCommit(repo, { tree, parents: [baseCommit], message });
@@ -466,15 +507,26 @@ export function pullMergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTIN
   const ancestorFlat = repo.flattenTree(repo.treeOfCommit(ancestor));
   const baseFlat = repo.flattenTree(repo.treeOfCommit(baseCommit));
   const headFlat = repo.flattenTree(repo.treeOfCommit(headCommit));
+  // Mirror mergePullRequest exactly, so `mergeable` never promises a merge that then fails.
+  const merged = new Map<string, { mode: string; oid: string }>();
   const paths = new Set<string>([...ancestorFlat.keys(), ...baseFlat.keys(), ...headFlat.keys()]);
   for (const path of paths) {
     const inAncestor = ancestorFlat.get(path);
     const inBase = baseFlat.get(path);
     const inHead = headFlat.get(path);
-    const baseChanged = inBase?.oid !== inAncestor?.oid || (inBase === undefined) !== (inAncestor === undefined);
-    const headChanged = inHead?.oid !== inAncestor?.oid || (inHead === undefined) !== (inAncestor === undefined);
-    if (baseChanged && headChanged && inBase?.oid !== inHead?.oid) return 'CONFLICTING';
+    const baseChanged = inBase?.oid !== inAncestor?.oid || inBase?.mode !== inAncestor?.mode || (inBase === undefined) !== (inAncestor === undefined);
+    const headChanged = inHead?.oid !== inAncestor?.oid || inHead?.mode !== inAncestor?.mode || (inHead === undefined) !== (inAncestor === undefined);
+    if (baseChanged && headChanged) {
+      if (inBase?.oid === inHead?.oid && inBase?.mode === inHead?.mode) {
+        if (inBase) merged.set(path, inBase);
+        continue;
+      }
+      return 'CONFLICTING';
+    }
+    const winner = headChanged ? inHead : inBase;
+    if (winner) merged.set(path, winner);
   }
+  if (flatHasCollision(merged)) return 'CONFLICTING';
   return 'MERGEABLE';
 }
 
